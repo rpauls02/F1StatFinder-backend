@@ -141,3 +141,4 @@ venv/
 __pycache__/
 *.pyc
 /fastf1/cache
+*.bat
