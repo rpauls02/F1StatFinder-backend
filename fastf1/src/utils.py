@@ -2,32 +2,90 @@ import pycountry
 import re
 
 
-def country_to_code(country_name):
-    try:
-        return pycountry.countries.lookup(country_name).alpha_2.lower()
-    except LookupError:
-        return None
+def iso2_country(country_input):
+    """
+    Maps a country name or list of country names to lowercase ISO alpha-2 codes using pycountry.
+    Falls back to first 2 lowercase letters if country not found.
+
+    Args:
+        country_input (str or list[str]): A single country name or list of country names.
+
+    Returns:
+        str or list[str]: A single lowercase ISO alpha-2 code or list of codes.
+    """
+
+    def get_alpha2_code(name: str) -> str:
+        try:
+            return pycountry.countries.lookup(name).alpha_2.lower()
+        except LookupError:
+            return name[:2].lower() if name else ""
+
+    if isinstance(country_input, str):
+        return get_alpha2_code(country_input)
+    elif isinstance(country_input, list):
+        return [get_alpha2_code(name) for name in country_input]
+    return ""
+
+
+def iso3_country(country_input):
+    """
+    Maps a country name or list of country names to lowercase ISO alpha-3 codes using pycountry.
+    Falls back to first 3 lowercase letters if country not found.
+
+    Args:
+        country_input (str or list[str]): A single country name or list of country names.
+
+    Returns:
+        str or list[str]: A single lowercase ISO alpha-3 code or list of codes.
+    """
+
+    def get_alpha3_code(name: str) -> str:
+        try:
+            return pycountry.countries.lookup(name).alpha_3.upper()
+        except LookupError:
+            return name[:3].upper() if name else ""
+
+    if isinstance(country_input, str):
+        return get_alpha3_code(country_input)
+    elif isinstance(country_input, list):
+        return [get_alpha3_code(name) for name in country_input]
+    return ""
 
 
 def slugify_location(location):
+    """
+    Creates an identifier for a race event.
+
+    Args:
+        location (str): Hosting city/country of race event.
+
+    Returns:
+        str: A string containing event host and shortened postfix "-gp".
+    """
+
     slug = location.lower().replace(" ", "-")
     slug = re.sub(r"[^\w\-]", "", slug)
     return f"{slug}-gp"
 
 
 def nationality_to_country_code(nationality: str) -> str:
-    """Convert nationality or country name to ISO 3166-1 alpha-2 code."""
+    """
+    Maps a nationality to lowercase ISO alpha-2 codes using pycountry.
+
+    Args:
+        nationality (str): Nationality of a driver.
+
+    Returns:
+        str: A single lowercase ISO alpha-2 code.
+    """
+
     try:
-        # Try to match nationality as country
         country = pycountry.countries.get(name=nationality)
         if country:
             return country.alpha_2.lower()
-
-        # Try to match by common name
         country = pycountry.countries.get(common_name=nationality)
         if country:
             return country.alpha_2.lower()
-
         mapping = {
             "American": "us",
             "Argentine": "ar",
