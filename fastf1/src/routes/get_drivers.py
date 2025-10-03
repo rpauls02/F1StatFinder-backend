@@ -3,65 +3,79 @@ from datetime import datetime, timezone
 import fastf1
 import pandas as pd
 from collections import defaultdict
+from cache import get_event_schedule_cached
 
 drivers_bp = Blueprint("drivers", __name__, url_prefix="/api/f1")
 
+
 @drivers_bp.route("/get_drivers")
 def get_drivers():
+    """
+    Fetch and return driver and team information for the latest completed F1 race
+    of the current season. Falls back to the second-latest race if needed.
+    """
     try:
-        now = datetime.now(timezone.utc)
         year = datetime.now().year
+        now = datetime.now(timezone.utc)
 
-        schedule = fastf1.get_event_schedule(year, include_testing=False)
+        # Fetch schedule
+        schedule = get_event_schedule_cached(year, include_testing=False)
+        if schedule.empty:
+            return jsonify({"error": f"No schedule found for {year}"}), 404
+
         latest_race = None
+        second_latest_race = None
         latest_race_date = None
+        second_latest_race_date = None
 
-        # Find latest completed race
+        # Identify latest and second-latest completed races
         for _, event in schedule.iterrows():
-            race_date_col = "Session5Date"
-            if race_date_col in event and pd.notna(event[race_date_col]):
-                race_date = event[race_date_col]
-                if race_date < now and (latest_race_date is None or race_date > latest_race_date):
-                    latest_race = event
-                    latest_race_date = race_date
+            race_date = event.get("Session5Date")
+            if pd.notna(race_date):
+                if race_date.tzinfo is None:
+                    race_date = race_date.tz_localize("UTC")
+                if race_date < now:
+                    if latest_race_date is None or race_date > latest_race_date:
+                        second_latest_race, second_latest_race_date = latest_race, latest_race_date
+                        latest_race, latest_race_date = event, race_date
+                    elif second_latest_race_date is None or race_date > second_latest_race_date:
+                        second_latest_race, second_latest_race_date = event, race_date
 
         if latest_race is None:
-            # Fallback to previous year if no races found
-            year -= 1
-            schedule = fastf1.get_event_schedule(year, include_testing=False)
-            for _, event in schedule.iterrows():
-                race_date_col = "Session5Date"
-                if race_date_col in event and pd.notna(event[race_date_col]):
-                    race_date = event[race_date_col]
-                    if race_date < now and (latest_race_date is None or race_date > latest_race_date):
-                        latest_race = event
-                        latest_race_date = race_date
+            return jsonify({"error": f"No completed races found for {year}"}), 404
 
-            if latest_race is None:
-                return jsonify({"error": f"No completed races found for {year} or {year - 1}"}), 404
-
-        # Load race session
-        event_round = int(latest_race["RoundNumber"])
-        session = fastf1.get_session(year, event_round, "R")
+        # Load race results
+        round_number = int(latest_race["RoundNumber"])
+        session = fastf1.get_session(year, round_number, "R")
         session.load(telemetry=False, laps=False, weather=False)
-
         results = session.results
-        if results.empty:
-            return jsonify({"error": "No results data available"}), 404
 
-        # Group drivers by team with team ID
+        # Fallback if empty
+        if results.empty or results[results["FullName"].notna() & results["TeamName"].notna()].empty:
+            if second_latest_race is None:
+                return jsonify({"error": "No drivers found in the latest race and no fallback available"}), 404
+            round_number = int(second_latest_race["RoundNumber"])
+            session = fastf1.get_session(year, round_number, "R")
+            session.load(telemetry=False, laps=False, weather=False)
+            results = session.results
+            if results.empty or results[results["FullName"].notna() & results["TeamName"].notna()].empty:
+                return jsonify({"error": "No drivers found in latest or fallback race"}), 404
+
+        # Group drivers by team
         teams = defaultdict(lambda: {"drivers": [], "teamId": None})
         for _, row in results.iterrows():
             if pd.notna(row.get("FullName")) and pd.notna(row.get("TeamName")) and pd.notna(row.get("TeamId")):
-                teams[row["TeamName"]]["drivers"].append(row["FullName"])
+                teams[row["TeamName"]]["drivers"].append(row["FullName"].strip())
                 teams[row["TeamName"]]["teamId"] = row["TeamId"]
 
-        # Transform into list of team objects
         driver_teams = [
             {"team": team, "id": info["teamId"], "drivers": info["drivers"]}
-            for team, info in teams.items()
+            for team, info in sorted(teams.items())
             if info["teamId"] is not None
         ]
+
+        if not driver_teams:
+            return jsonify({"error": f"No drivers found for {year}"}), 404
 
         return jsonify(driver_teams)
 

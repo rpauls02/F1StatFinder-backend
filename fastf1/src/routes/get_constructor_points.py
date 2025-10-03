@@ -1,80 +1,110 @@
 from flask import Blueprint, jsonify
-from fastf1.ergast import Ergast
-import fastf1
 import pandas as pd
-from iso3166 import countries
+from utils import iso3_country, slugify_location
+from cache import (
+    get_event_schedule_cached,
+    get_race_results_cached,
+    get_sprint_results_cached,
+)
 
 constructor_points_bp = Blueprint("constructor_points", __name__, url_prefix="/api/f1")
 
 
 @constructor_points_bp.route("/get_constructor_points/<int:year>")
 def get_constructor_points(year):
+    """
+    Fetch constructor points for a given F1 season, including race and sprint points.
+    Adds a 'slug' field for each race based on its location.
+    """
     try:
-        ergast = Ergast(result_type="pandas", auto_cast=True)
-        schedule = fastf1.get_event_schedule(year, include_testing=False)
+        # Get race schedule
+        schedule = get_event_schedule_cached(year, include_testing=False)
 
-        rounds = schedule["RoundNumber"].tolist()
-        races = schedule["EventName"].tolist()
-        countries_list = schedule["Country"].tolist()
+        if schedule.empty:
+            return jsonify({"error": f"No event schedule found for {year}"}), 404
 
-        # Map each race to ISO country code
-        race_country_map = []
-        for country_name in countries_list:
-            try:
-                iso_code = countries.get(country_name).alpha3
-            except KeyError:
-                iso_code = country_name[:3].upper()  # fallback
-            race_country_map.append(iso_code)
+        rounds = schedule.get("RoundNumber", []).tolist()
+        events = schedule.get("EventName", []).tolist()
+        countries = schedule.get("Country", []).tolist()
+        locations = schedule.get("Location", []).tolist()
 
+        if not rounds or not events or not countries or not locations:
+            return jsonify({"error": f"Incomplete schedule data for {year}"}), 500
+
+        country_codes = iso3_country(countries)
         constructor_points = {}
 
-        for rnd, race_name, country_code in zip(rounds, races, race_country_map):
-            try:
-                results = ergast.get_race_results(year, round=rnd).content[0]
-            except Exception:
-                results = pd.DataFrame()
+        # Process each race
+        for round_number, race_name, country_code, location in zip(
+            rounds, events, country_codes, locations
+        ):
+            race_slug = slugify_location(location)
+            weekend_points = {}
 
+            # Fetch race results safely
             try:
-                sprint_results = ergast.get_sprint_results(year, round=rnd).content[0]
+                race_data = get_race_results_cached(year, round_number).content
+                race_results = race_data[0] if race_data else pd.DataFrame()
+            except Exception:
+                race_results = pd.DataFrame()
+
+            # Fetch sprint results safely
+            try:
+                sprint_data = get_sprint_results_cached(year, round_number).content
+                sprint_results = sprint_data[0] if sprint_data else pd.DataFrame()
             except Exception:
                 sprint_results = pd.DataFrame()
 
-            # ✅ Merge race + sprint by constructor
-            combined_results = pd.concat([results, sprint_results], ignore_index=True)
+            # Aggregate weekend points
+            for df in [race_results, sprint_results]:
+                if df.empty:
+                    continue
+                for _, row in df.iterrows():
+                    cid = row.get("constructorId")
+                    cname = row.get("constructorName", "Unknown")
+                    points = float(row.get("points", 0.0) or 0.0)
 
-            if not combined_results.empty:
-                grouped = (
-                    combined_results.groupby("constructorId", as_index=False)
-                    .agg({
-                        "constructorName": "first",
-                        "points": "sum"  # add all driver + sprint points
-                    })
-                )
-            else:
-                grouped = pd.DataFrame()
+                    if cid not in weekend_points:
+                        weekend_points[cid] = {
+                            "constructorId": cid,
+                            "constructor": cname,
+                            "weekend_points": 0.0,
+                        }
+                    weekend_points[cid]["weekend_points"] += points
 
-            for _, r in grouped.iterrows():
-                cid = r["constructorId"]
-                cname = r.get("constructorName", "Unknown")
-                points = float(r["points"]) if not pd.isna(r["points"]) else 0.0
+            # Sort and assign weekend positions
+            sorted_weekend = sorted(
+                weekend_points.values(), key=lambda x: x["weekend_points"], reverse=True
+            )
 
+            for pos, data in enumerate(sorted_weekend, start=1):
+                cid = data["constructorId"]
                 if cid not in constructor_points:
                     constructor_points[cid] = {
                         "constructorId": cid,
-                        "constructor": cname,
+                        "constructor": data["constructor"],
                         "total": 0.0,
                         "races": [],
                     }
 
-                constructor_points[cid]["races"].append(
-                    {"name": race_name, "country": country_code, "points": points}
-                )
-                constructor_points[cid]["total"] += points
+                constructor_points[cid]["races"].append({
+                    "name": race_name,
+                    "slug": race_slug,
+                    "country": country_code,
+                    "points": data["weekend_points"],
+                    "position": pos,
+                })
+                constructor_points[cid]["total"] += data["weekend_points"]
 
-        # Convert dict to list and sort
-        constructors_list = list(constructor_points.values())
-        constructors_list.sort(key=lambda c: c["total"], reverse=True)
+        if not constructor_points:
+            return jsonify({"error": f"No constructor points available for {year}"}), 404
 
+        # Convert to list and sort by total points
+        constructors_list = sorted(
+            constructor_points.values(), key=lambda c: c["total"], reverse=True
+        )
+
+        # Assign championship positions
         for idx, constructor in enumerate(constructors_list, start=1):
             constructor["position"] = idx
 

@@ -1,86 +1,102 @@
 from flask import Blueprint, jsonify
-import fastf1
-from datetime import datetime, timezone
 import pandas as pd
+from datetime import datetime, timezone
+from cache import (
+    get_event_schedule_cached,
+    get_race_results_cached,
+    get_qualifying_results_cached,
+)
 
 constructor_stats_bp = Blueprint("constructor_stats", __name__, url_prefix="/api/f1")
 
 
 @constructor_stats_bp.route("/get_constructor_stats")
 def get_constructor_stats():
+    """
+    Fetch and return constructor statistics (wins, podiums, poles, DNFs) for the current F1 season.
+    Results are cached for 24 hours to reduce API calls.
+    Returns JSON with constructor stats or an error message if the request fails.
+    """
     year = datetime.now().year
-    now = datetime.now(timezone.utc)
-
     try:
-        ergast = fastf1.ergast.Ergast(result_type="pandas", auto_cast=True)
+        # Fetch event schedule for the current year, excluding testing sessions
+        schedule = get_event_schedule_cached(year, include_testing=False)
 
-        # Get the event schedule for the season
-        schedule = fastf1.get_event_schedule(year, include_testing=False)
         if schedule.empty:
             return jsonify({"error": f"No event schedule found for {year}"}), 404
-        rounds = schedule["RoundNumber"].tolist()
 
-        # Collect all constructor IDs across all races
+        rounds = schedule.get("RoundNumber", []).tolist()
+        if not rounds:
+            return jsonify({"error": f"No rounds found in schedule for {year}"}), 404
+
         all_constructor_ids = set()
+        # Collect all constructor IDs
         for rnd in rounds:
             try:
-                results = ergast.get_race_results(season=year, round=rnd).content[0]
-                if not results.empty:
-                    all_constructor_ids.update(results["constructorId"].unique())
-            except:
-                continue  # skip missing or failed rounds
+                results = get_race_results_cached(year, rnd)
+                if results and not results.content[0].empty:
+                    all_constructor_ids.update(results.content[0].get("constructorId", []))
+            except Exception:
+                continue
+
+        if not all_constructor_ids:
+            return jsonify({"error": f"No constructor data available for {year}"}), 404
 
         constructor_stats_list = []
 
+        # Process each constructor
         for constructor_id in all_constructor_ids:
-            wins = 0
-            podiums = 0
-            poles = 0
-            name = None
-            nationality = None
+            wins = podiums = poles = dnfs = 0
 
             for rnd in rounds:
                 # Race results
                 try:
-                    results = ergast.get_race_results(season=year, round=rnd).content[0]
-                    if results.empty:
-                        continue
-                    results["position"] = results["position"].astype(int)
-                    constructor_rows = results[results["constructorId"] == constructor_id]
-
-                    if not constructor_rows.empty:
-                        wins += int((constructor_rows["position"] == 1).sum())
-                        podiums += int((constructor_rows["position"] <= 3).sum())
-
-                        if name is None:
-                            first_row = constructor_rows.iloc[0]
-                            name = first_row["constructorName"]
-                            nationality = first_row["constructorNationality"]
-                except:
+                    results = get_race_results_cached(year, rnd)
+                    if results and not results.content[0].empty:
+                        df = results.content[0].copy()
+                        df["position"] = pd.to_numeric(df.get("position", pd.Series()), errors="coerce")
+                        constructor_rows = df[df.get("constructorId") == constructor_id]
+                        if not constructor_rows.empty:
+                            wins += int((constructor_rows["position"] == 1).sum())
+                            podiums += int((constructor_rows["position"] <= 3).sum())
+                            dnfs += int(
+                                constructor_rows.get("status", pd.Series()).str.contains(
+                                    r"Did Not Finish|Retired|Accident|Collision|Disqualified|Withdrew|"
+                                    r"Mechanical|Engine|Gearbox|Transmission|Clutch|Hydraulics|Electrical|"
+                                    r"Suspension|Brakes|Differential|Overheating|Oil leak|Wheel|Tyre|"
+                                    r"Puncture|Driveshaft|Fuel|Exhaust|Throttle|Steering|Chassis|Battery|"
+                                    r"Alternator|Radiator|Turbo|Power Unit|ERS|Spun off|Damage|Debris",
+                                    case=False,
+                                    na=False,
+                                ).sum()
+                            )
+                except Exception:
                     continue
 
-                # Qualifying results → poles
+                # Qualifying results
                 try:
-                    quali = ergast.get_qualifying_results(season=year, round=rnd).content[0]
-                    if not quali.empty:
-                        quali["position"] = quali["position"].astype(int)
-                        constructor_quali = quali[quali["constructorId"] == constructor_id]
+                    quali = get_qualifying_results_cached(year, rnd)
+                    if quali and not quali.content[0].empty:
+                        q_df = quali.content[0].copy()
+                        q_df["position"] = pd.to_numeric(q_df.get("position", pd.Series()), errors="coerce")
+                        constructor_quali = q_df[q_df.get("constructorId") == constructor_id]
                         if not constructor_quali.empty:
                             poles += int((constructor_quali["position"] == 1).sum())
-                except:
+                except Exception:
                     continue
 
-            constructor_stats_list.append({
-                "id": constructor_id,
-                "name": name,
-                "nationality": nationality,
-                "wins": wins,
-                "podiums": podiums,
-                "poles": poles
-            })
+            constructor_stats_list.append(
+                {
+                    "id": constructor_id,
+                    "wins": wins,
+                    "podiums": podiums,
+                    "poles": poles,
+                    "dnfs": dnfs,
+                }
+            )
 
-        # Sort by wins descending, then podiums, then poles
-        constructor_stats_list.sort(key=lambda c: (-c["wins"], -c["podiums"], -c["poles"]))
+        if not constructor_stats_list:
+            return jsonify({"error": f"No constructor stats available for {year}"}), 404
 
         return jsonify(constructor_stats_list)
 

@@ -1,57 +1,63 @@
 from flask import Blueprint, jsonify
-import fastf1
 from datetime import datetime, timezone
 import pandas as pd
-from utils import country_to_code, slugify_location
+from utils import iso2_country, slugify_location
+from cache import get_event_schedule_cached
 
 next_event_bp = Blueprint("next_event", __name__, url_prefix="/api/f1")
 
 
 @next_event_bp.route("/get_next_event")
 def get_next_event():
-    session_names = ["Practice 1", "Practice 2", "Practice 3", "Qualifying", "Race"]
     try:
-        now = datetime.now(timezone.utc)
-        upcoming_event = None
         year = datetime.now().year
+        now = datetime.now(timezone.utc)
 
-        # Get season schedule
-        schedule = fastf1.get_event_schedule(year, include_testing=False)
+        schedule = get_event_schedule_cached(year, include_testing=False)
+        if schedule.empty:
+            return jsonify({"error": f"No event schedule found for {year}"}), 404
 
-        # Find the next upcoming race
-        for _, event in schedule.iterrows():
-            for i in range(1, 6):
-                session_date_col = f"Session{i}Date"
-                if session_date_col in event and pd.notna(event[session_date_col]):
-                    if event[session_date_col] > now:
-                        upcoming_event = event
-                        break
-            if upcoming_event is not None:
-                break
-
-        if upcoming_event is None or not isinstance(upcoming_event, pd.Series):
+        # Filter upcoming races and sort
+        upcoming_events = schedule[schedule["Session5Date"] > now].sort_values(
+            "Session5Date"
+        )
+        if upcoming_events.empty:
             return jsonify({"error": f"No upcoming race found for {year}"}), 404
 
-        # Prepare sessions info
-        sessions = []
-        for i, session_name in enumerate(session_names, start=1):
-            session_date_col = f"Session{i}Date"
-            if session_date_col in upcoming_event and pd.notna(upcoming_event[session_date_col]):
-                session_dt = upcoming_event[session_date_col]
-                sessions.append({
-                    "name": session_name,
-                    "date": session_dt.strftime("%B %d"),
-                    "time": session_dt.strftime("%H:%M")
-                })
+        upcoming_event = upcoming_events.iloc[0]
+
+        # Map event type more safely
+        format_map = {
+            "sprint": "Sprint Event",
+            "sprint_shootout": "Sprint Event",
+            "sprint_qualifying": "Sprint Event",
+            "conventional": "GP Event",
+        }
+        event_type = format_map.get(
+            upcoming_event.get("EventFormat", "conventional"), "GP Event"
+        )
+
+        race_date = (
+            upcoming_event["Session5Date"].strftime("%d %B %Y")
+            if pd.notna(upcoming_event["Session5Date"])
+            else None
+        )
+        race_time = (
+            upcoming_event["Session5Date"].strftime("%H:%M %p")
+            if pd.notna(upcoming_event["Session5Date"])
+            else None
+        )
 
         race_info = {
-            "eventName": upcoming_event["EventName"].replace("Grand Prix", "GP"),
+            "eventName": upcoming_event["EventName"].replace("Grand Prix", "GP", 1),
             "round": int(upcoming_event["RoundNumber"]),
-            "country": upcoming_event["Country"],
-            "location": upcoming_event["Location"],
-            "countryCode": country_to_code(upcoming_event["Country"]),
+            "country": str(upcoming_event["Country"]),
+            "location": str(upcoming_event["Location"]),
+            "countryCode": iso2_country(upcoming_event["Country"]) or None,
             "slug": slugify_location(upcoming_event["Location"]),
-            "sessions": sessions
+            "eventType": event_type,
+            "raceDate": race_date,
+            "raceTime": race_time,
         }
 
         return jsonify(race_info)

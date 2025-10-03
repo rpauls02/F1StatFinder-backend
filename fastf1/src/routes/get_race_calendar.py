@@ -1,49 +1,61 @@
 from flask import Blueprint, jsonify
-import fastf1
-from datetime import datetime
 import pandas as pd
-from utils import country_to_code, slugify_location
+from utils import iso2_country, iso3_country, slugify_location
+from cache import get_event_schedule_cached
 
-calendar_bp = Blueprint("calendar", __name__, url_prefix="/api/f1")
+race_calendar_bp = Blueprint("race_calendar", __name__, url_prefix="/api/f1")
 
-
-@calendar_bp.route("/get_race_calendar")
-def get_race_calendar():
-    year = datetime.now().year
-    session_names = ["Practice 1", "Practice 2", "Practice 3", "Qualifying", "Race"]
-    calendar = []
-
+@race_calendar_bp.route("/get_race_calendar/<int:year>")
+def get_race_calendar(year):
     try:
-        schedule = fastf1.get_event_schedule(year, include_testing=False)
+        # Standard session names
+        default_sessions = ["Practice 1", "Practice 2", "Practice 3", "Qualifying", "Race"]
+
+        schedule = get_event_schedule_cached(year, include_testing=False)
+        calendar = []
 
         for _, event in schedule.iterrows():
             sessions = []
-            for i, session_name in enumerate(session_names, start=1):
-                session_date_col = f"Session{i}Date"
-                try:
-                    if session_date_col in event and not pd.isna(event[session_date_col]):
-                        sessions.append({
-                            "name": session_name,
-                            "date": event[session_date_col].strftime("%b %d"),
-                            "time": event[session_date_col].strftime("%H:%M")
-                        })
-                except Exception:
-                    continue  # skip invalid session dates
 
-            if sessions:  # Only include events with at least one valid session
+            # Pick session labels based on event format
+            if str(event.get("EventFormat")).lower() in {"sprint", "sprint_qualifying", "sprint_shootout"}:
+                session_names = ["Practice 1", "Qualifying", "Sprint Shootout", "Sprint", "Race"]
+            else:
+                session_names = default_sessions
+
+            # Build session list
+            for i, session_name in enumerate(session_names, start=1):
+                for suffix in ["DateUtc", "Date"]:  # try both
+                    col = f"Session{i}{suffix}"
+                    if col in event and pd.notna(event[col]):
+                        dt = event[col]
+                        if hasattr(dt, "strftime"):
+                            sessions.append({
+                                "name": session_name,
+                                "date": dt.strftime("%b %d"),
+                                "time": dt.strftime("%H:%M"),
+                            })
+                        break  # found valid column for this session
+
+            if sessions:
                 calendar.append({
-                    "round": int(event["RoundNumber"]),
-                    "eventName": event["EventName"].replace("Grand Prix", "GP"),
-                    "country": event["Country"],
-                    "location": event["Location"],
-                    "countryCode": country_to_code(event["Country"]),
-                    "slug": slugify_location(event["Location"]),
-                    "sessions": sessions
+                    "round": int(event.get("RoundNumber", 0)),
+                    "country": str(event.get("Country", "")),
+                    "location": str(event.get("Location", "")),
+                    "officialEventName": str(event.get("OfficialEventName", "")),
+                    "eventName": str(event.get("EventName", "")),
+                    "eventDate": event["EventDate"].strftime("%Y-%m-%dT%H:%M:%SZ")
+                                 if pd.notna(event.get("EventDate")) and hasattr(event["EventDate"], "strftime")
+                                 else None,
+                    "eventFormat": str(event.get("EventFormat", "")),
+                    "countryCode2": iso2_country(event.get("Country")) or None,
+                    "countryCode3": iso3_country(event.get("Country")) or None,
+                    "slug": slugify_location(event.get("Location", "")),
+                    "sessions": sessions,
                 })
 
-        # Sort the calendar by round number
+        # Sort calendar by round
         calendar.sort(key=lambda r: r["round"])
-
         return jsonify({"year": year, "calendar": calendar})
 
     except Exception as e:

@@ -1,43 +1,65 @@
 from flask import Blueprint, jsonify
-from fastf1.ergast import Ergast
 from datetime import datetime
 from utils import nationality_to_country_code
+from cache import get_driver_standings_cached
 
+# Initialize Blueprint for F1 driver standings API
 driver_standings_bp = Blueprint("driver_standings", __name__, url_prefix="/api/f1")
 
 
 @driver_standings_bp.route("/get_driver_standings")
 def get_driver_standings():
+    """
+    Fetch and return driver standings for the current F1 season from Ergast API.
+    Results are cached for 1 hour to reduce API calls.
+    Returns JSON with driver standings or an error message if the request fails.
+    """
     year = datetime.now().year
-    try:
-        ergast = Ergast(result_type="pandas", auto_cast=True)
-        standings_response = ergast.get_driver_standings(year)
 
-        if not standings_response.content or standings_response.content[0].empty:
-            return jsonify({"error": f"No driver standings found for {year}"}), 404
+    try:
+        # Fetch driver standings for the current year
+        standings_response = get_driver_standings_cached(year)
+
+        # Validate response
+        if not standings_response or not getattr(standings_response, "content", None):
+            return jsonify({"error": f"No driver standings response found for {year}"}), 404
+
+        standings_df = standings_response.content[0]
+        if standings_df.empty:
+            return jsonify({"error": f"No driver standings data available for {year}"}), 404
 
         standings_list = []
 
-        for driver in standings_response.content[0].to_dict(orient="records"):
-            first_initial = (
-                driver.get("givenName", "")[0] if driver.get("givenName") else ""
-            )
-            formatted_name = f"{first_initial}. {driver.get('familyName', '')}"
+        # Process each driver in the standings
+        for driver in standings_df.to_dict(orient="records"):
+            try:
+                first_initial = (
+                    driver.get("givenName", "")[0] if driver.get("givenName") else ""
+                )
+                formatted_name = f"{first_initial}. {driver.get('familyName', '')}".strip()
 
-            standings_list.append(
-                {
-                    "id": driver.get("driverId"),
+                standings_list.append({
+                    "id": driver.get("driverId", "unknown"),
                     "position": int(driver.get("position", 0)),
                     "nationality": nationality_to_country_code(
                         driver.get("driverNationality", "")
                     ),
-                    "name": formatted_name,
-                    "constructor": driver.get("constructorNames", ["Unknown"])[0],
-                    "points": int(driver.get("points", 0)),
-                }
-            )
+                    "name": formatted_name or "Unknown",
+                    "constructor": (
+                        driver.get("constructorNames")[0]
+                        if driver.get("constructorNames")
+                        else "Unknown"
+                    ),
+                    "points": float(driver.get("points", 0) or 0.0),
+                })
+            except (ValueError, TypeError, IndexError, KeyError):
+                # Skip invalid rows without breaking the endpoint
+                continue
 
-        # Sort by position just in case
+        if not standings_list:
+            return jsonify({"error": f"No valid driver standings found for {year}"}), 404
+
+        # Sort standings by position
         standings_list.sort(key=lambda d: d["position"])
 
         return jsonify(standings_list)

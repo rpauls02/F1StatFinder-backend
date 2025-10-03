@@ -1,47 +1,63 @@
 from flask import Blueprint, jsonify
-from fastf1.ergast import Ergast
 from datetime import datetime
+from utils import nationality_to_country_code
+from cache import get_driver_standings_cached, get_constructor_standings_cached
 
-champions_bp = Blueprint("champions", __name__, url_prefix="/api/f1")
+# Initialize Blueprint for F1 previous champions API
+previous_champions_bp = Blueprint("previous_champions", __name__, url_prefix="/api/f1")
 
 
-@champions_bp.route("/get_champions")
+@previous_champions_bp.route("/get_previous_champions")
 def get_champions():
-    current_year = datetime.now().year
-    results = []
-
     try:
-        ergast = Ergast(result_type="pandas", auto_cast=True)
+        current_year = datetime.now().year
+        results = []
 
-        # Get the last 5 seasons including the current year
-        for year in range(current_year, current_year - 5, -1):
-            # Default values
-            wdc_name = "N/A"
-            wcc_name = "N/A"
+        for year in range(current_year, current_year - 3, -1):
+            champion_data = {
+                "year": year,
+                "wdc": "N/A",
+                "wdcNationality": "N/A",
+                "wdcPoints": 0.0,
+                "wcc": "N/A",
+                "wccNationality": "N/A",
+                "wccPoints": 0.0,
+            }
 
-            # Fetch driver standings
             try:
-                driver_standings = ergast.get_driver_standings(year)
+                driver_standings = get_driver_standings_cached(year)
                 if driver_standings.content and not driver_standings.content[0].empty:
                     wdc_driver = driver_standings.content[0].iloc[0]
-                    wdc_name = f"{wdc_driver['givenName'][0]}. {wdc_driver['familyName']}"
+                    champion_data["wdc"] = (
+                        f"{wdc_driver['givenName'][0]}. {wdc_driver['familyName']}"
+                    )
+                    wdc_nat = wdc_driver.get("driverNationality")
+                    champion_data["wdcNationality"] = (
+                        nationality_to_country_code(wdc_nat) or "N/A"
+                    )
+                    champion_data["wdcPoints"] = float(wdc_driver.get("points", 0) or 0)
             except Exception:
-                pass  # Keep "N/A" if fetching fails
+                pass
 
-            # Fetch constructor standings
             try:
-                constructor_standings = ergast.get_constructor_standings(year)
-                if constructor_standings.content and not constructor_standings.content[0].empty:
+                constructor_standings = get_constructor_standings_cached(year)
+                if (
+                    constructor_standings.content
+                    and not constructor_standings.content[0].empty
+                ):
                     wcc_constructor = constructor_standings.content[0].iloc[0]
-                    wcc_name = wcc_constructor["constructorName"]
+                    champion_data["wcc"] = wcc_constructor["constructorName"]
+                    wcc_nat = wcc_constructor.get("constructorNationality")
+                    champion_data["wccNationality"] = (
+                        nationality_to_country_code(wcc_nat) or "N/A"
+                    )
+                    champion_data["wccPoints"] = float(
+                        wcc_constructor.get("points", 0) or 0
+                    )
             except Exception:
-                pass  # Keep "N/A" if fetching fails
+                pass
 
-            results.append({
-                "year": year,
-                "wdc": wdc_name,
-                "wcc": wcc_name
-            })
+            results.append(champion_data)
 
         return jsonify(results)
 
